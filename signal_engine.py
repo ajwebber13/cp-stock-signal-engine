@@ -171,8 +171,11 @@ def run_daily_scan():
         send_telegram(format_summary(results))
 
     print(f"\n✅ Scan complete. {fired} signal(s) sent.")
-    return results
+    fired_signals = [s for s in results if s["signal"]]
+    return fired_signals
 
 
 if __name__ == "__main__":
-    run_daily_scan()
+    from picks_tracker import run_tracker
+    fired_signals = run_daily_scan()
+    run_tracker(fired_signals)
