@@ -1,15 +1,9 @@
-# CP Analytics | Stock Signal Engine
-# requirements.txt
-
 yfinance>=0.2.40
 pandas>=2.0.0
-pandas-ta>=0.3.14b
 numpy>=1.24.0
 scikit-learn>=1.3.0
 xgboost>=2.0.0
 lightgbm>=4.0.0
 joblib>=1.3.0
 requests>=2.31.0
-
-# Optional — only needed for LSTM (Model 4)
-# tensorflow>=2.15.0
+ta>=0.11.0

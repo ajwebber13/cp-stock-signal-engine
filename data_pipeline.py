@@ -5,7 +5,7 @@ data_pipeline.py — Price data ingestion and feature engineering
 
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
+import ta as ta_lib
 import numpy as np
 from datetime import datetime, timedelta
 
