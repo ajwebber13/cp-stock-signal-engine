@@ -1,13 +1,20 @@
 """
 CP Analytics | Stock Signal Engine
 data_pipeline.py — Price data ingestion and feature engineering
-Uses the 'ta' library instead of pandas_ta for better compatibility.
+Builds TWO labels per row: a day-trade target and a swing-trade target,
+so one dataset can train both models.
 """
 
-import yfinance as yf
+try:
+    import yfinance as yf
+except Exception:  # pragma: no cover
+    yf = None
 import pandas as pd
 import numpy as np
-import ta
+try:
+    import ta
+except Exception:  # pragma: no cover
+    ta = None
 from datetime import datetime, timedelta
 
 
@@ -17,11 +24,20 @@ WATCHLIST = [
 ]
 
 LOOKBACK_DAYS = 365
-FORWARD_DAYS  = 5
-TARGET_MOVE   = 0.03
+
+# Day-trade target: smaller move, shorter window
+DAY_FORWARD_DAYS  = 1
+DAY_TARGET_MOVE   = 0.015   # 1.5%
+
+# Swing-trade target: bigger move, longer window
+SWING_FORWARD_DAYS = 5
+SWING_TARGET_MOVE  = 0.03   # 3%
 
 
 def fetch_ticker(symbol: str) -> pd.DataFrame:
+    if yf is None:
+        raise ImportError("yfinance is required for fetch_ticker; install with: pip install yfinance")
+
     end   = datetime.today()
     start = end - timedelta(days=LOOKBACK_DAYS)
     df = yf.download(symbol, start=start, end=end, progress=False, auto_adjust=True)
@@ -88,8 +104,19 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_labels(df: pd.DataFrame) -> pd.DataFrame:
-    future_max = df["Close"].shift(-1).rolling(FORWARD_DAYS).max().shift(-(FORWARD_DAYS - 1))
-    df["target"] = ((future_max - df["Close"]) / df["Close"] >= TARGET_MOVE).astype(int)
+    """
+    Adds two label columns:
+      target_day   — 1 if price rises DAY_TARGET_MOVE within DAY_FORWARD_DAYS
+      target_swing — 1 if price rises SWING_TARGET_MOVE within SWING_FORWARD_DAYS
+    """
+    close = df["Close"]
+
+    future_max_day = close.shift(-1).rolling(DAY_FORWARD_DAYS).max().shift(-(DAY_FORWARD_DAYS - 1))
+    df["target_day"] = ((future_max_day - close) / close >= DAY_TARGET_MOVE).astype(int)
+
+    future_max_swing = close.shift(-1).rolling(SWING_FORWARD_DAYS).max().shift(-(SWING_FORWARD_DAYS - 1))
+    df["target_swing"] = ((future_max_swing - close) / close >= SWING_TARGET_MOVE).astype(int)
+
     return df
 
 
@@ -119,9 +146,16 @@ FEATURE_COLS = [
     "day_of_week",
 ]
 
+TARGET_COLS = {
+    "day":   "target_day",
+    "swing": "target_swing",
+}
+
 
 if __name__ == "__main__":
     print("Building dataset...")
     df = build_dataset()
     df.to_csv("stock_features.csv")
-    print(f"Done. {len(df)} rows, {df['target'].mean():.1%} positive labels.")
+    print(f"Done. {len(df)} rows.")
+    print(f"  Day target positive rate:   {df['target_day'].mean():.1%}")
+    print(f"  Swing target positive rate: {df['target_swing'].mean():.1%}")

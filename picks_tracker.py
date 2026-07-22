@@ -1,26 +1,27 @@
 """
 CP Analytics | Stock Signal Engine
-picks_tracker.py — Log signals and track real-world outcomes
-Stores picks in a CSV, checks results after 5 days, reports accuracy.
+picks_tracker.py — Log signals and track real-world outcomes.
+Tracks day and swing picks SEPARATELY so you know which one actually wins.
 """
 
 import os
 import csv
-import json
 import requests
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
 
 
-PICKS_FILE      = "picks_log.csv"
-FORWARD_DAYS    = 5
-TARGET_MOVE     = 0.03       # 3% gain = win
-TELEGRAM_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT   = os.getenv("TELEGRAM_CHAT_ID", "")
+PICKS_FILE = "picks_log.csv"
+
+# Must match data_pipeline.py
+FORWARD_DAYS = {"day": 1, "swing": 5}
+TARGET_MOVE  = {"day": 0.015, "swing": 0.03}
+
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
 FIELDNAMES = [
-    "date", "symbol", "prob", "price_at_signal",
+    "date", "symbol", "signal_type", "prob", "price_at_signal",
     "target_date", "price_at_target", "pct_change",
     "hit_target", "resolved"
 ]
@@ -50,15 +51,23 @@ def save_log(df: pd.DataFrame):
 # ── Log a New Signal ─────────────────────────────────────────────────────────
 
 def log_signal(signal: dict):
-    """Call this for every ticker that fires a signal."""
+    """
+    Call this for every ticker that fires a signal.
+    signal must include 'signal_type' ('day' or 'swing') and the matching
+    '<type>_prob' key, set by signal_engine.py.
+    """
     init_log()
-    signal_date  = datetime.strptime(signal["date"], "%Y-%m-%d")
-    target_date  = signal_date + timedelta(days=FORWARD_DAYS)
+    signal_type = signal["signal_type"]
+    forward_days = FORWARD_DAYS[signal_type]
+
+    signal_date = datetime.strptime(signal["date"], "%Y-%m-%d")
+    target_date = signal_date + timedelta(days=forward_days)
 
     row = {
         "date":             signal["date"],
         "symbol":           signal["symbol"],
-        "prob":             signal["prob"],
+        "signal_type":      signal_type,
+        "prob":             signal[f"{signal_type}_prob"],
         "price_at_signal":  signal["price"],
         "target_date":      target_date.strftime("%Y-%m-%d"),
         "price_at_target":  "",
@@ -71,7 +80,8 @@ def log_signal(signal: dict):
         writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
         writer.writerow(row)
 
-    print(f"  [Tracker] Logged {signal['symbol']} @ ${signal['price']} (prob: {signal['prob']*100:.1f}%)")
+    print(f"  [Tracker] Logged {signal['symbol']} ({signal_type}) @ ${signal['price']} "
+          f"(prob: {row['prob']*100:.1f}%)")
 
 
 # ── Resolve Pending Picks ────────────────────────────────────────────────────
@@ -83,8 +93,8 @@ def resolve_picks():
         print("[Tracker] No picks to resolve.")
         return df
 
-    today       = datetime.today().date()
-    pending     = df[df["resolved"] == False]
+    today   = datetime.today().date()
+    pending = df[df["resolved"] == False]
     newly_resolved = []
 
     for idx, row in pending.iterrows():
@@ -92,24 +102,24 @@ def resolve_picks():
         if today < target_date:
             continue
 
-        # Fetch price on or after target date
         start = target_date
         end   = target_date + timedelta(days=5)
         hist  = yf.download(row["symbol"], start=start, end=end,
-                            progress=False, auto_adjust=True)
+                             progress=False, auto_adjust=True)
 
         if hist.empty:
             continue
 
-        price_at_target = float(hist["Close"].iloc[0])
-        pct_change      = (price_at_target - float(row["price_at_signal"])) / float(row["price_at_signal"])
-        hit_target      = pct_change >= TARGET_MOVE
+        target_move      = TARGET_MOVE[row["signal_type"]]
+        price_at_target  = float(hist["Close"].iloc[0])
+        pct_change       = (price_at_target - float(row["price_at_signal"])) / float(row["price_at_signal"])
+        hit_target       = pct_change >= target_move
 
         df.at[idx, "price_at_target"] = round(price_at_target, 2)
         df.at[idx, "pct_change"]      = round(pct_change * 100, 2)
         df.at[idx, "hit_target"]      = hit_target
         df.at[idx, "resolved"]        = True
-        newly_resolved.append(row["symbol"])
+        newly_resolved.append(f"{row['symbol']} ({row['signal_type']})")
 
     save_log(df)
 
@@ -125,53 +135,50 @@ def performance_report(df: pd.DataFrame) -> str:
     resolved = df[df["resolved"] == True]
 
     if resolved.empty:
-        return "📊 *CP Analytics | Picks Tracker*\n\nNo resolved picks yet — check back after 5 trading days."
+        return "📊 **CP Analytics | Picks Tracker**\n\nNo resolved picks yet."
 
-    total    = len(resolved)
-    wins     = resolved["hit_target"].sum()
-    losses   = total - wins
-    win_rate = wins / total * 100
-    avg_move = resolved["pct_change"].mean()
-    best     = resolved.loc[resolved["pct_change"].idxmax()]
-    worst    = resolved.loc[resolved["pct_change"].idxmin()]
+    sections = ["📊 **CP Analytics | Picks Performance**", "━━━━━━━━━━━━━━━━━━━━"]
 
-    # Last 10 picks
+    for signal_type in ["day", "swing"]:
+        subset = resolved[resolved["signal_type"] == signal_type]
+        label = "Day Trade" if signal_type == "day" else "Swing Trade"
+
+        if subset.empty:
+            sections.append(f"**{label}:** no resolved picks yet.")
+            continue
+
+        total    = len(subset)
+        wins     = subset["hit_target"].sum()
+        losses   = total - wins
+        win_rate = wins / total * 100
+        avg_move = subset["pct_change"].mean()
+
+        sections.append(
+            f"**{label}**\n"
+            f"Total: `{total}`   Win rate: `{win_rate:.1f}%`  ({int(wins)}W / {int(losses)}L)\n"
+            f"Avg move: `{avg_move:+.1f}%`"
+        )
+
     recent = resolved.tail(10)
-    rows   = []
+    rows = []
     for _, r in recent.iterrows():
         result = "✅" if r["hit_target"] else "❌"
-        rows.append(f"{result} *${r['symbol']}*  `{r['pct_change']:+.1f}%`  {r['date']}")
+        tag = "D" if r["signal_type"] == "day" else "S"
+        rows.append(f"{result} **${r['symbol']}** [{tag}]  `{r['pct_change']:+.1f}%`  {r['date']}")
 
-    report = f"""
-📊 *CP Analytics | Picks Performance*
-━━━━━━━━━━━━━━━━━━━━
-*Total picks:*   `{total}`
-*Win rate:*      `{win_rate:.1f}%`  ({int(wins)}W / {int(losses)}L)
-*Avg move:*      `{avg_move:+.1f}%`
-*Best pick:*     `${best['symbol']} {best['pct_change']:+.1f}%`
-*Worst pick:*    `${worst['symbol']} {worst['pct_change']:+.1f}%`
+    sections.append("**Recent picks:**\n" + "\n".join(rows))
+    sections.append("━━━━━━━━━━━━━━━━━━━━\n⚠️ _Educational only. Not financial advice._")
 
-*Recent picks:*
-{chr(10).join(rows)}
-━━━━━━━━━━━━━━━━━━━━
-⚠️ _Educational only. Not financial advice._
-""".strip()
-
-    return report
+    return "\n\n".join(sections)
 
 
-# ── Telegram ─────────────────────────────────────────────────────────────────
+# ── Discord ──────────────────────────────────────────────────────────────────
 
-def send_telegram(message: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
+def send_discord(message: str):
+    if not DISCORD_WEBHOOK_URL:
         print(message)
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={
-        "chat_id":    TELEGRAM_CHAT,
-        "text":       message,
-        "parse_mode": "Markdown",
-    }, timeout=10)
+    requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=10)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -179,23 +186,20 @@ def send_telegram(message: str):
 def run_tracker(signals: list = None):
     """
     Call after run_daily_scan().
-    signals = list of dicts from score_ticker that fired above threshold.
+    signals = list of dicts, each with 'signal_type' set ('day' or 'swing').
     """
     print("\n[Tracker] Running picks tracker...")
 
-    # Log any new signals
     if signals:
         for s in signals:
             log_signal(s)
 
-    # Resolve pending picks
     df = resolve_picks()
 
-    # Send performance report if we have resolved picks
     resolved = df[df["resolved"] == True] if not df.empty else pd.DataFrame()
     if not resolved.empty:
         report = performance_report(df)
-        send_telegram(report)
+        send_discord(report)
         print("[Tracker] Performance report sent.")
     else:
         print("[Tracker] No resolved picks yet.")

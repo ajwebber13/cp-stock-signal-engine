@@ -1,14 +1,14 @@
-name: CP Analytics Daily Stock Scan
+name: CP Analytics Weekly Model Retrain
 
 on:
   schedule:
-    - cron: '0 14 * * 1-5'   # 9am ET, weekdays
+    - cron: '0 10 * * 6'   # Saturday 5am ET, after markets close for the week
   workflow_dispatch:
 
 jobs:
-  scan:
+  retrain:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repo
@@ -22,15 +22,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run daily scan (scoring only — no training)
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python signal_engine.py
+      - name: Retrain models
+        run: python train_models.py
 
-      - name: Commit updated picks log
+      - name: Commit updated models
         run: |
           git config user.name "cp-analytics-bot"
           git config user.email "bot@cultureandpulse.com"
-          git add picks_log.csv
-          git diff --staged --quiet || git commit -m "Update picks log $(date +%Y-%m-%d)"
+          git add models/
+          git diff --staged --quiet || git commit -m "Retrain models $(date +%Y-%m-%d)"
           git push

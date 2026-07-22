@@ -1,42 +1,57 @@
 """
 CP Analytics | Stock Signal Engine
-signal_engine.py — Daily scanner, signal scoring, Telegram alerts
-Designed for GitHub Actions — auto-trains on each run, no persisted model needed.
+signal_engine.py — Daily scanner, signal scoring, Discord alerts.
+
+Does NOT train. Loads models saved by train_models.py (run weekly).
+If no saved models exist, this will tell you to run train_models.py first.
 """
 
 import os
+import joblib
 import numpy as np
 import pandas as pd
 import requests
 from datetime import datetime
-from data_pipeline import fetch_ticker, add_indicators, FEATURE_COLS, WATCHLIST, build_dataset
-from model_trainer import train_all, EnsembleScorer
+from data_pipeline import fetch_ticker, add_indicators, FEATURE_COLS, WATCHLIST, TARGET_COLS
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
-TELEGRAM_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT   = os.getenv("TELEGRAM_CHAT_ID", "")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
-SIGNAL_THRESHOLD = 0.60     # fire alert if ensemble prob >= 60%
-MAX_ALERTS       = 5        # cap daily alerts to top N picks
+MODEL_DIR = "models"
+SIGNAL_THRESHOLD = 0.60     # fire alert if model prob >= 60%
+MAX_ALERTS       = 5        # cap alerts per target type, per run
 
 
-# ── Build & Train (runs fresh each time) ────────────────────────────────────
+# ── Load Saved Models ────────────────────────────────────────────────────────
 
-def build_and_train() -> EnsembleScorer:
-    """Fetch data, engineer features, train ensemble. ~3-5 min on Actions."""
-    print("Building dataset...")
-    df = build_dataset(WATCHLIST)
-    df.to_csv("stock_features.csv")
-    print(f"Dataset ready: {len(df)} rows, {df['target'].mean():.1%} positive labels")
-    return train_all("stock_features.csv")
+def load_model(target_name: str):
+    """Load the saved XGBoost model + scaler for one target ('day' or 'swing')."""
+    model_path  = f"{MODEL_DIR}/xgboost_{target_name}.pkl"
+    scaler_path = f"{MODEL_DIR}/scaler_{target_name}.pkl"
+
+    if not os.path.exists(model_path) or not os.path.exists(scaler_path):
+        raise FileNotFoundError(
+            f"No saved model for '{target_name}'. Run train_models.py first."
+        )
+
+    model  = joblib.load(model_path)
+    scaler = joblib.load(scaler_path)
+    return model, scaler
+
+
+def load_all_models() -> dict:
+    models = {}
+    for target_name in TARGET_COLS:
+        models[target_name] = load_model(target_name)
+    return models
 
 
 # ── Signal Scoring ───────────────────────────────────────────────────────────
 
-def score_ticker(symbol: str, ensemble: EnsembleScorer) -> dict | None:
-    """Fetch latest data, engineer features, return signal score for one ticker."""
+def score_ticker(symbol: str, models: dict) -> dict | None:
+    """Fetch latest data, engineer features, score against both models."""
     df = fetch_ticker(symbol)
     if df.empty or len(df) < 30:
         return None
@@ -46,14 +61,11 @@ def score_ticker(symbol: str, ensemble: EnsembleScorer) -> dict | None:
     if df.empty:
         return None
 
-    X_raw = df[FEATURE_COLS].values
-    prob  = ensemble.score_ticker(X_raw)
+    X_raw   = df[FEATURE_COLS].values[-1:]   # most recent row only
+    latest  = df.iloc[-1]
 
-    latest = df.iloc[-1]
-
-    return {
+    result = {
         "symbol":       symbol,
-        "prob":         round(prob, 4),
         "price":        round(float(latest["Close"]), 2),
         "rsi":          round(float(latest["rsi_14"]), 1),
         "macd_hist":    round(float(latest["macd_hist"]), 4),
@@ -61,9 +73,16 @@ def score_ticker(symbol: str, ensemble: EnsembleScorer) -> dict | None:
         "price_vs_50d": round(float(latest["price_vs_sma50"]) * 100, 2),
         "return_5d":    round(float(latest["return_5d"]) * 100, 2),
         "above_200d":   bool(latest["Close"] > latest["sma_200"]),
-        "signal":       prob >= SIGNAL_THRESHOLD,
         "date":         str(df.index[-1].date()),
     }
+
+    for target_name, (model, scaler) in models.items():
+        X = scaler.transform(X_raw)
+        prob = float(model.predict_proba(X)[0, 1])
+        result[f"{target_name}_prob"]   = round(prob, 4)
+        result[f"{target_name}_signal"] = prob >= SIGNAL_THRESHOLD
+
+    return result
 
 
 # ── Signal Interpretation ────────────────────────────────────────────────────
@@ -80,25 +99,28 @@ def rsi_label(rsi: float) -> str:
     return f"Neutral ({rsi})"
 
 
-# ── Telegram Formatting ──────────────────────────────────────────────────────
+# ── Discord Formatting ───────────────────────────────────────────────────────
+# Discord markdown: **bold**, `code`, _italic_ (different from Telegram's *bold*)
 
-def format_alert(signal: dict) -> str:
-    strength = signal_strength(signal["prob"])
+def format_alert(signal: dict, target_name: str) -> str:
+    prob     = signal[f"{target_name}_prob"]
+    strength = signal_strength(prob)
     trend    = "📈" if signal["above_200d"] else "📉"
     vol_flag = "⚡ Volume spike" if signal["vol_ratio"] > 1.5 else ""
+    label    = "Day Trade" if target_name == "day" else "Swing Trade"
 
     return f"""
-📊 *CP Analytics | Stock Signal*
+📊 **CP Analytics | {label} Signal**
 ━━━━━━━━━━━━━━━━━━━━
-*${signal['symbol']}*  {trend}  {strength}
+**${signal['symbol']}**  {trend}  {strength}
 
-*Signal Score:*  `{signal['prob'] * 100:.1f}%`
-*Price:*         `${signal['price']}`
-*RSI:*           `{rsi_label(signal['rsi'])}`
-*vs 50-day MA:*  `{signal['price_vs_50d']:+.1f}%`
-*5-day return:*  `{signal['return_5d']:+.1f}%`
-*Volume ratio:*  `{signal['vol_ratio']}x avg` {vol_flag}
-*MACD hist:*     `{signal['macd_hist']}`
+**Signal Score:**  `{prob * 100:.1f}%`
+**Price:**         `${signal['price']}`
+**RSI:**           `{rsi_label(signal['rsi'])}`
+**vs 50-day MA:**  `{signal['price_vs_50d']:+.1f}%`
+**5-day return:**  `{signal['return_5d']:+.1f}%`
+**Volume ratio:**  `{signal['vol_ratio']}x avg` {vol_flag}
+**MACD hist:**     `{signal['macd_hist']}`
 
 📅 {signal['date']}
 ━━━━━━━━━━━━━━━━━━━━
@@ -106,35 +128,38 @@ def format_alert(signal: dict) -> str:
 """.strip()
 
 
-def format_summary(signals: list) -> str:
-    header = f"📊 *CP Analytics | Daily Watchlist*\n📅 {datetime.today().strftime('%b %d, %Y')}\n━━━━━━━━━━━━━━━━━━━━\n"
+def format_summary(signals: list, target_name: str) -> str:
+    label = "Day Trade" if target_name == "day" else "Swing Trade"
+    prob_key = f"{target_name}_prob"
+    header = (
+        f"📊 **CP Analytics | {label} Watchlist**\n"
+        f"📅 {datetime.today().strftime('%b %d, %Y')}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+    )
+    ranked = sorted(signals, key=lambda x: x[prob_key], reverse=True)
     rows = []
-    for s in signals[:10]:
-        bar = "█" * int(s["prob"] * 10) + "░" * (10 - int(s["prob"] * 10))
-        rows.append(f"*${s['symbol']}*  `{bar}`  `{s['prob']*100:.0f}%`  ${s['price']}")
+    for s in ranked[:10]:
+        prob = s[prob_key]
+        bar = "█" * int(prob * 10) + "░" * (10 - int(prob * 10))
+        rows.append(f"**${s['symbol']}**  `{bar}`  `{prob*100:.0f}%`  ${s['price']}")
     footer = "\n━━━━━━━━━━━━━━━━━━━━\n⚠️ _Educational only. Not financial advice._"
     return header + "\n".join(rows) + footer
 
 
-# ── Telegram Dispatch ────────────────────────────────────────────────────────
+# ── Discord Dispatch ──────────────────────────────────────────────────────────
 
-def send_telegram(message: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
-        print("[Telegram] No credentials — printing to console instead.")
+def send_discord(message: str):
+    if not DISCORD_WEBHOOK_URL:
+        print("[Discord] No webhook URL set — printing to console instead.")
         print(message)
         return
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    resp = requests.post(url, json={
-        "chat_id":    TELEGRAM_CHAT,
-        "text":       message,
-        "parse_mode": "Markdown",
-    }, timeout=10)
+    resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=10)
 
-    if resp.status_code == 200:
-        print("[Telegram] Sent successfully.")
+    if resp.status_code in (200, 204):
+        print("[Discord] Sent successfully.")
     else:
-        print(f"[Telegram] Error {resp.status_code}: {resp.text}")
+        print(f"[Discord] Error {resp.status_code}: {resp.text}")
 
 
 # ── Main Scanner ─────────────────────────────────────────────────────────────
@@ -144,35 +169,42 @@ def run_daily_scan():
     print(f"CP Analytics Stock Scanner — {datetime.today().strftime('%Y-%m-%d %H:%M')}")
     print(f"{'='*50}")
 
-    # Train fresh on each run (required for GitHub Actions stateless env)
-    ensemble = build_and_train()
-    results  = []
+    models = load_all_models()
+    results = []
 
     print("\nScoring watchlist...")
     for sym in WATCHLIST:
         print(f"  {sym}...", end=" ")
-        signal = score_ticker(sym, ensemble)
+        signal = score_ticker(sym, models)
         if signal:
             results.append(signal)
-            print(f"{signal['prob']*100:.1f}% {'← SIGNAL' if signal['signal'] else ''}")
+            print(f"day {signal['day_prob']*100:.0f}% / swing {signal['swing_prob']*100:.0f}%")
         else:
             print("skipped")
 
-    results.sort(key=lambda x: x["prob"], reverse=True)
+    all_fired = []
 
-    fired = 0
-    for signal in results:
-        if signal["signal"] and fired < MAX_ALERTS:
-            send_telegram(format_alert(signal))
-            fired += 1
+    for target_name in TARGET_COLS:
+        signal_key = f"{target_name}_signal"
+        fired_list = [s for s in results if s[signal_key]]
+        fired_list.sort(key=lambda x: x[f"{target_name}_prob"], reverse=True)
 
-    if fired == 0:
-        print("  No signals above threshold — sending summary.")
-        send_telegram(format_summary(results))
+        fired = 0
+        for signal in fired_list:
+            if fired < MAX_ALERTS:
+                send_discord(format_alert(signal, target_name))
+                fired += 1
 
-    print(f"\n✅ Scan complete. {fired} signal(s) sent.")
-    fired_signals = [s for s in results if s["signal"]]
-    return fired_signals
+        if fired == 0:
+            print(f"  No {target_name} signals above threshold — sending summary.")
+            send_discord(format_summary(results, target_name))
+        else:
+            for s in fired_list[:MAX_ALERTS]:
+                s["signal_type"] = target_name
+                all_fired.append(s)
+
+    print(f"\n✅ Scan complete. {len(all_fired)} signal(s) sent.")
+    return all_fired
 
 
 if __name__ == "__main__":
