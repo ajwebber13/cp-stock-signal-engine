@@ -1,1 +1,2 @@
 date,symbol,signal_type,prob,price_at_signal,target_date,price_at_target,pct_change,hit_target,resolved
+2026-07-22,META,swing,0.8899,629.62,2026-07-27,,,,False
