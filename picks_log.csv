@@ -3,3 +3,7 @@ date,symbol,signal_type,prob,price_at_signal,target_date,price_at_target,pct_cha
 2026-07-23,TSLA,swing,0.9491,323.41,2026-07-28,,,,False
 2026-07-23,TSLA,swing,0.9491,323.41,2026-07-28,,,,False
 2026-07-23,GOOGL,swing,0.7026,320.04,2026-07-28,,,,False
+2026-07-24,TSLA,swing,0.9374,310.82,2026-07-29,,,,False
+2026-07-24,TSLA,swing,0.9374,310.82,2026-07-29,,,,False
+2026-07-24,GOOGL,swing,0.6793,320.8,2026-07-29,,,,False
+2026-07-24,META,swing,0.6051,608.04,2026-07-29,,,,False
